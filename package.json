@@ -1,0 +1,48 @@
+{
+  "name": "fwoom",
+  "version": "0.0.0",
+  "description": "A next-generation web framework for building fast and scalable APIs and web applications.",
+  "author": "",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node src/index.ts",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "framework",
+    "web",
+    "http",
+    "api",
+    "rest",
+    "fast",
+    "performance",
+    "edge",
+    "bun",
+    "deno",
+    "cloudflare",
+    "node",
+    "router",
+    "fwoom",
+    "typescript",
+    "javascript"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  }
+}
