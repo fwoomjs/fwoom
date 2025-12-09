@@ -1,111 +1,147 @@
-import type {
-	IncomingHttpHeaders,
-	IncomingMessage,
-	ServerResponse,
-} from "http";
 import type { RawRequestNode, RawResponseNode } from "../runtime/HttpAdapter";
-import { HttpError } from "../error/HttpError";
 
-export interface ContextOptions {
-	rawReq: RawRequestNode;
-	rawRes: RawResponseNode;
-	path: string;
-	method: string;
-	params: Record<string, string>;
-	query: Record<string, string | string[]>;
-	di: Record<string, unknown>;
+export interface FwoomContextOptions {
+  rawReq: RawRequestNode;
+  rawRes: RawResponseNode;
+  method: string;
+  path: string;
+  params: Record<string, string>;
+  query: Record<string, string | string[]>;
+  di: Record<string, unknown>;
 }
 
-export class FwoomContext {
-	// core
-	readonly req: IncomingMessage;
-	readonly res: ServerResponse;
-	readonly method: string;
-	readonly path: string;
-	readonly params: Record<string, string>;
-	readonly query: Record<string, string | string[]>;
-	readonly headers: IncomingHttpHeaders;
-
-	// mutable
-	body: any;
-	state: Record<string, unknown>;
-	di: Record<string, unknown>;
-	status: number;
-
-	private _manualResponse = false;
-
-	constructor(opts: ContextOptions) {
-		const { rawReq, rawRes, path, method, params, query, di } = opts;
-		this.req = rawReq.req;
-		this.res = rawRes.res;
-		this.method = method.toUpperCase();
-		this.path = path;
-		this.params = params;
-		this.query = query;
-		this.headers = this.req.headers;
-		this.body = undefined;
-		this.state = {};
-		this.di = di;
-		this.status = 200;
-	}
-
-	set(field: string, value: string): void {
-		this.res.setHeader(field, value);
-	}
-
-	get(field: string): string | undefined {
-		const key = field.toLowerCase();
-		return this.headers[key] as string | undefined;
-	}
-
-	send(body: any): void {
-		if (this._manualResponse) return;
-		this._manualResponse = true;
-
-		if (!this.res.headersSent) {
-			this.res.statusCode = this.status;
-		}
-
-		if (body === null || body === undefined) {
-			this.res.end();
-			return;
-		}
-
-		if (Buffer.isBuffer(body)) {
-			this.res.end(body);
-			return;
-		}
-
-		if (typeof body === "string") {
-			this.res.end(body);
-			return;
-		}
-
-		if (!this.res.getHeader("content-type")) {
-			this.res.setHeader("content-type", "application/json; charset=utf-8");
-		}
-		this.res.end(JSON.stringify(body));
-	}
-
-	json(body: any): void {
-		if (!this.res.getHeader("content-type")) {
-			this.res.setHeader("content-type", "application/json; charset=utf-8");
-		}
-		this.send(JSON.stringify(body));
-	}
-
-	throw(status: number, message?: string, details?: any): never {
-		throw new HttpError(status, message, details);
-	}
-
-	hrtime(): bigint {
-		return process.hrtime.bigint();
-	}
-
-	hrtimeDiff(start: bigint): number {
-		const diff = process.hrtime.bigint() - start;
-		return Number(diff) / 1_000_000; // ms
-	}
+export interface ContextSendLike {
+  send(body: any): void;
+  json(obj: any): void;
+  text(str: string): void;
+  status(code: number): this;
+  set(name: string, value: string): this;
 }
 
-export type Context = FwoomContext;
+export interface Context extends ContextSendLike {
+  req: any;
+  res: any;
+
+  method: string;
+  path: string;
+  params: Record<string, string>;
+  query: Record<string, string | string[]>;
+  searchParams: URLSearchParams;
+
+  headers: Record<string, string | string[] | undefined>;
+  body: any;
+
+  di: Record<string, unknown>;
+
+  throw(status: number, message?: string): never;
+
+  // internal flags
+  _manualResponse: boolean;
+  _statusSet: boolean;
+}
+
+export class FwoomContext implements Context {
+  req: any;
+  res: any;
+
+  method: string;
+  path: string;
+
+  params: Record<string, string>;
+  query: Record<string, string | string[]>;
+
+  searchParams: URLSearchParams;
+
+  headers: Record<string, string | string[] | undefined>;
+
+  body: any = undefined;
+
+  di: Record<string, unknown>;
+
+  _manualResponse = false;
+  _statusSet = false;
+
+  constructor(opts: FwoomContextOptions) {
+    const { rawReq, rawRes } = opts;
+
+    this.req = rawReq.req;
+    this.res = rawRes.res;
+
+    this.method = opts.method;
+    this.path = opts.path;
+
+    this.params = opts.params;
+    this.query = opts.query;
+
+    this.searchParams = new URLSearchParams();
+
+    // Build searchParams once (lazy parse query)
+    for (const key in opts.query) {
+      const val = opts.query[key];
+      if (Array.isArray(val)) {
+        val.forEach((v) => this.searchParams.append(key, v));
+      } else {
+        this.searchParams.set(key, val);
+      }
+    }
+
+    this.headers = this.req.headers;
+    this.di = opts.di;
+  }
+
+  status(code: number): this {
+    this.res.statusCode = code;
+    this._statusSet = true;
+    return this;
+  }
+
+  set(name: string, value: string): this {
+    this.res.setHeader(name.toLowerCase(), value);
+    return this;
+  }
+
+  send(body: any): void {
+    this._manualResponse = true;
+
+    if (body === undefined || body === null) {
+      this.res.end();
+      return;
+    }
+
+    if (Buffer.isBuffer(body)) {
+      this.res.end(body);
+      return;
+    }
+
+    if (typeof body === "string") {
+      this.res.end(body);
+      return;
+    }
+
+    // Fallback JSON
+    this.res.setHeader("content-type", "application/json; charset=utf-8");
+    this.res.end(JSON.stringify(body));
+  }
+
+  json(obj: any): void {
+    this._manualResponse = true;
+    this.res.setHeader("content-type", "application/json; charset=utf-8");
+    this.res.end(JSON.stringify(obj));
+  }
+
+  text(str: string): void {
+    this._manualResponse = true;
+    this.res.setHeader("content-type", "text/plain; charset=utf-8");
+    this.res.end(str);
+  }
+
+  // -------------------------------------------------------------------
+  // Error Handling
+  // -------------------------------------------------------------------
+
+  throw(status: number, message?: string): never {
+    const err: any = new Error(message || "Error");
+    err.status = status;
+    throw err;
+  }
+}

@@ -1,25 +1,32 @@
 import type { Context } from "../context/Context";
-import { HttpError } from "./HttpError";
 
-export type ErrorHandler = (err: Error, ctx: Context) => Promise<void> | void;
+export type ErrorHandler = (err: any, ctx: Context) => any | Promise<any>;
 
-export const defaultErrorHandler: ErrorHandler = (err, ctx) => {
-	const isHttp = err instanceof HttpError;
-	const status = isHttp ? err.statusCode : 500;
+export const defaultErrorHandler: ErrorHandler = async (err, ctx) => {
+  const status = typeof err.status === "number" ? err.status : 500;
+  const message = err.message || "Internal Server Error";
 
-	const body: any = {
-		error: isHttp ? err.message : "Internal Server Error",
-	};
+  // Prevent crash if handler throws after response was already sent
+  const resAny: any = (ctx as any).res;
+  const replied = resAny?.headersSent || resAny?.writableEnded;
 
-	if (isHttp && err.details) {
-		body.details = err.details;
-	}
+  if (replied) {
+    console.error("Fwoom Error after response was already sent:", err);
+    return;
+  }
 
-	if (!ctx.res.headersSent) {
-		ctx.status = status;
-		ctx.json(body);
-	} else {
-		// Last resort logging
-		console.error(err);
-	}
+  ctx.status(status);
+
+  const isDev = process.env.NODE_ENV !== "production";
+
+  const errorBody: any = {
+    status,
+    message,
+  };
+
+  if (isDev && err.stack) {
+    errorBody.stack = err.stack;
+  }
+
+  ctx.json(errorBody);
 };
