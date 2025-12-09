@@ -1,6 +1,11 @@
 import { Router } from "../router/Router";
 import { FwoomContext, Context } from "../context/Context";
-import { runPipeline, Middleware, Handler } from "../pipeline/Pipeline";
+import {
+	compilePipeline,
+	runCompiledPipeline,
+	Middleware,
+	Handler,
+} from "../pipeline/Pipeline";
 import { parsePathAndQuery } from "../utils/url";
 import { defaultErrorHandler, ErrorHandler } from "../error/ErrorHandler";
 
@@ -21,14 +26,15 @@ export interface FwoomConstructorOptions extends FwoomOptions {
 export class Fwoom {
 	private adapter: HttpAdapter;
 	private router: Router;
+
 	private middlewares: Middleware[] = [];
 	private di: Record<string, unknown> = {};
 	private errorHandler: ErrorHandler = defaultErrorHandler;
+
 	private options: Required<FwoomOptions>;
 	private started = false;
 
 	constructor(opts?: FwoomConstructorOptions) {
-		// Merge base options
 		const mergedOpts: Required<FwoomOptions> = {
 			...defaultOptions,
 			...(opts || {}),
@@ -38,7 +44,6 @@ export class Fwoom {
 			},
 		};
 
-		// Adapter: use provided adapter or default NodeAdapter
 		const adapter = opts?.adapter ?? new NodeAdapter(mergedOpts.server);
 
 		this.adapter = adapter;
@@ -46,63 +51,71 @@ export class Fwoom {
 		this.options = mergedOpts;
 	}
 
-	// ---------- ROUTING HELPERS ----------
+	// -------------------------------------------------------------------
+	// Routing
+	// -------------------------------------------------------------------
 
 	private addRoute(method: string, path: string, handler: Handler): this {
-		this.router.addRoute({ method: method.toUpperCase(), path, handler });
+		this.router.addRoute({
+			method: method.toUpperCase(),
+			path,
+			handler,
+		});
 		return this;
 	}
 
 	get(path: string, handler: Handler): this {
 		return this.addRoute("GET", path, handler);
 	}
-
 	post(path: string, handler: Handler): this {
 		return this.addRoute("POST", path, handler);
 	}
-
 	put(path: string, handler: Handler): this {
 		return this.addRoute("PUT", path, handler);
 	}
-
 	patch(path: string, handler: Handler): this {
 		return this.addRoute("PATCH", path, handler);
 	}
-
 	delete(path: string, handler: Handler): this {
 		return this.addRoute("DELETE", path, handler);
 	}
-
 	head(path: string, handler: Handler): this {
 		return this.addRoute("HEAD", path, handler);
 	}
-
 	optionsRoute(path: string, handler: Handler): this {
 		return this.addRoute("OPTIONS", path, handler);
 	}
 
-	// ---------- MIDDLEWARE ----------
+	// -------------------------------------------------------------------
+	// Middleware
+	// -------------------------------------------------------------------
 
 	use(mw: Middleware): this {
 		this.middlewares.push(mw);
 		return this;
 	}
 
-	// ---------- DEPENDENCY INJECTION ----------
+	// -------------------------------------------------------------------
+	// Dependency Injection
+	// -------------------------------------------------------------------
 
 	decorate(name: string, value: unknown): this {
 		this.di[name] = value;
 		return this;
 	}
 
-	// ---------- ERROR HANDLING ----------
+	// -------------------------------------------------------------------
+	// Error Handling
+	// -------------------------------------------------------------------
 
 	setErrorHandler(handler: ErrorHandler): this {
 		this.errorHandler = handler;
 		return this;
 	}
 
-	// ---------- SERVER LIFECYCLE ----------
+	// -------------------------------------------------------------------
+	// Server Lifecycle
+	// -------------------------------------------------------------------
 
 	async listen(port = 3000, host = "0.0.0.0"): Promise<void> {
 		if (this.started) {
@@ -112,7 +125,7 @@ export class Fwoom {
 
 		await this.adapter.listen(port, host, (rawReq, rawRes) => {
 			this.handleRequest(rawReq, rawRes).catch((err) => {
-				console.error("Unhandled Fwoom internal error:", err);
+				console.error("Fwoom Internal Error:", err);
 			});
 		});
 	}
@@ -121,7 +134,9 @@ export class Fwoom {
 		await this.adapter.close();
 	}
 
-	// ---------- REQUEST HANDLING CORE ----------
+	// -------------------------------------------------------------------
+	// Core Request Handler
+	// -------------------------------------------------------------------
 
 	private async handleRequest(
 		rawReq: RawRequestNode,
@@ -153,19 +168,25 @@ export class Fwoom {
 
 		try {
 			await this.readBody(ctx);
-			await runPipeline(this.middlewares, match.route.handler, ctx);
+
+			const compiled = compilePipeline(this.middlewares, match.route.handler);
+
+			await runCompiledPipeline(compiled, ctx);
 		} catch (err: any) {
 			await this.errorHandler(err, ctx);
 		}
 	}
 
-	// ---------- BODY PARSER ----------
+	// -------------------------------------------------------------------
+	// Body Parsing
+	// -------------------------------------------------------------------
 
 	private async readBody(ctx: Context): Promise<void> {
 		const req = ctx.req;
 		const method = ctx.method;
 
-		if (!["POST", "PUT", "PATCH"].includes(method)) {
+		// Skip body parsing for GET/HEAD/OPTIONS
+		if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
 			ctx.body = undefined;
 			return;
 		}
@@ -188,6 +209,7 @@ export class Fwoom {
 				}
 				chunks.push(chunk);
 			});
+
 			req.on("end", () => resolve());
 			req.on("error", reject);
 		});
