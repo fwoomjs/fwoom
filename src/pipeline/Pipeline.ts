@@ -8,16 +8,22 @@ export interface CompiledPipeline {
   steps: Middleware[]; // flattened middleware + handler-wrapper
 }
 
-const pipelineCache = new WeakMap<Handler, CompiledPipeline>();
+const pipelineCache: WeakMap<Middleware[], WeakMap<Handler, CompiledPipeline>> = new WeakMap();
 
 export function compilePipeline(
   middlewares: Middleware[],
   handler: Handler
 ): CompiledPipeline {
-  const cached = pipelineCache.get(handler);
+  let inner = pipelineCache.get(middlewares);
+  if (!inner) {
+    inner = new WeakMap();
+    pipelineCache.set(middlewares, inner);
+  }
+
+  const cached = inner.get(handler);
   if (cached) return cached;
 
-  // Copy middleware list (snapshot for this handler)
+  // Copy middleware list (we assume caller created snapshot already)
   const steps: Middleware[] = [...middlewares];
 
   // Wrap handler into a final-step middleware
@@ -38,7 +44,7 @@ export function compilePipeline(
   steps.push(handlerWrapper);
 
   const compiled: CompiledPipeline = { steps };
-  pipelineCache.set(handler, compiled);
+  inner.set(handler, compiled);
   return compiled;
 }
 
@@ -50,18 +56,14 @@ export async function runCompiledPipeline(
   const len = steps.length;
 
   let index = 0;
-  const calledFlags = new Array<boolean>(len);
 
   const next = async (): Promise<void> => {
     if (index >= len) return;
-
     const currentIdx = index++;
-    calledFlags[currentIdx] = true;
     await steps[currentIdx](ctx, next);
   };
 
   try {
-    // Kick off the pipeline by invoking next()
     await next();
     return;
   } catch (err) {
