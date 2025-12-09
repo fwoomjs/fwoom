@@ -1,17 +1,7 @@
 import type { Handler } from "../pipeline/Pipeline";
 
-/**
- * A precompiled, flat, zero-regex router.
- *
- * Design:
- * - Per-method route tables
- * - Static routes in a Map<string, RouteRecord>
- * - Dynamic routes in a small array, with pre-split pattern segments
- * - Shared path-split buffer to avoid allocations on hot path
- */
-
 export interface RouteDefinition {
-  method: string; // "GET", "POST", ...
+  method: string;
   path: string;
   handler: Handler;
 }
@@ -20,15 +10,21 @@ interface CompiledRoute {
   method: string;
   path: string;
   handler: Handler;
-  segments: string[];       // ["users", ":id"]
-  paramIndices: number[];   // [1]
-  paramNames: string[];     // ["id"]
+  segments: string[];      
+  paramIndices: number[];  
+  paramNames: string[];    
   hasParams: boolean;
+
+  // WILDCARD SUPPORT
+  wildcard: boolean;
+  wildcardName?: string;
+  wildcardIndex?: number;
 }
 
 interface MethodTable {
   static: Map<string, CompiledRoute>;
   dynamic: CompiledRoute[];
+  wildcards: CompiledRoute[];
 }
 
 interface MatchResult {
@@ -37,8 +33,6 @@ interface MatchResult {
 }
 
 const MAX_SEGMENTS = 16;
-// Shared array reused for splitting paths at runtime.
-// Matching is fully synchronous, so reuse is safe per request.
 const sharedSegments: string[] = new Array(MAX_SEGMENTS);
 
 export class Router {
@@ -50,11 +44,11 @@ export class Router {
 
     const compiled = this.compileRoute(def);
 
-    if (!compiled.hasParams) {
-      // Static route: exact path match
+    if (compiled.wildcard) {
+      table.wildcards.push(compiled);
+    } else if (!compiled.hasParams) {
       table.static.set(def.path, compiled);
     } else {
-      // Dynamic route: has params
       table.dynamic.push(compiled);
     }
   }
@@ -64,32 +58,22 @@ export class Router {
     const table = this.methods.get(m);
     if (!table) return null;
 
-    // 1. Static match: O(1)
+    // 1. Static match
     const staticRoute = table.static.get(path);
-    if (staticRoute) {
-      return { route: staticRoute, params: {} };
+    if (staticRoute) return { route: staticRoute, params: {} };
+
+    // 2. Dynamic match
+    const { length: segLen } = splitPath(path);
+    if (matchDynamic(table.dynamic, segLen)) {
+      return matchDynamic(table.dynamic, segLen)!;
     }
 
-    // 2. Dynamic routes: O(N * segments)
-    if (table.dynamic.length === 0) return null;
-
-    const { length: segLen } = splitPathIntoSharedSegments(path);
-
-    for (let i = 0; i < table.dynamic.length; i++) {
-      const route = table.dynamic[i];
-
-      if (segLen !== route.segments.length) continue;
-
-      if (!matchSegments(route, segLen)) continue;
-
-      const params = extractParams(route, segLen);
-      return { route, params };
-    }
+    // 3. Wildcard match
+    const wcMatch = matchWildcard(table.wildcards, segLen);
+    if (wcMatch) return wcMatch;
 
     return null;
   }
-
-  // ----- Internal helpers -----
 
   private ensureMethodTable(method: string): MethodTable {
     let table = this.methods.get(method);
@@ -97,6 +81,7 @@ export class Router {
       table = {
         static: new Map(),
         dynamic: [],
+        wildcards: [],
       };
       this.methods.set(method, table);
     }
@@ -104,56 +89,59 @@ export class Router {
   }
 
   private compileRoute(def: RouteDefinition): CompiledRoute {
-    // Normalize path segments at registration time
     const segments = normalizePath(def.path).split("/").filter(Boolean);
 
     const paramIndices: number[] = [];
     const paramNames: string[] = [];
 
+    let wildcard = false;
+    let wildcardName: string | undefined;
+    let wildcardIndex: number | undefined;
+
+    // detect param & wildcard
     segments.forEach((seg, idx) => {
-      if (seg.startsWith(":") && seg.length > 1) {
+      if (seg.startsWith(":")) {
         paramIndices.push(idx);
         paramNames.push(seg.slice(1));
+      } else if (seg.startsWith("*")) {
+        wildcard = true;
+        wildcardName = seg.slice(1);
+        wildcardIndex = idx;
       }
     });
 
+    // validation: wildcard only allowed at the end
+    if (wildcard && wildcardIndex !== segments.length - 1) {
+      throw new Error(
+        `Wildcard only allowed at end of path: "${def.path}"`
+      );
+    }
+
     return {
-      method: def.method.toUpperCase(),
+      method: def.method,
       path: def.path,
       handler: def.handler,
       segments,
       paramIndices,
       paramNames,
       hasParams: paramIndices.length > 0,
+      wildcard,
+      wildcardName,
+      wildcardIndex
     };
   }
 }
 
-// Normalize: ensure leading slash, no trailing slash (except root)
-function normalizePath(path: string): string {
-  if (!path) return "/";
-  if (!path.startsWith("/")) path = "/" + path;
-  if (path.length > 1 && path.endsWith("/")) {
-    path = path.slice(0, -1);
-  }
-  return path;
-}
-
-/**
- * Split the incoming path string into the sharedSegments buffer.
- * Returns length of meaningful segments.
- */
-function splitPathIntoSharedSegments(path: string): { length: number } {
-  // Basic normalization: ensure leading slash
+function splitPath(path: string): { length: number } {
   if (!path.startsWith("/")) path = "/" + path;
 
   let len = 0;
-  let start = 1; // skip leading '/'
-
+  let start = 1;
   const n = path.length;
+
   for (let i = 1; i <= n; i++) {
-    const charCode = i === n ? 47 /* '/' sentinel */ : path.charCodeAt(i);
-    if (charCode === 47 /* '/' */) {
+    const charCode = i === n ? 47 : path.charCodeAt(i);
+    if (charCode === 47) {
       if (i > start) {
         if (len === MAX_SEGMENTS) break;
         sharedSegments[len++] = path.slice(start, i);
@@ -165,50 +153,67 @@ function splitPathIntoSharedSegments(path: string): { length: number } {
   return { length: len };
 }
 
-/**
- * Compares the sharedSegments buffer with the route's precompiled segments,
- * ignoring positions that are params.
- */
-function matchSegments(route: CompiledRoute, segLen: number): boolean {
-  const pattern = route.segments;
-  const paramsIdx = route.paramIndices;
+function matchDynamic(dynamic: CompiledRoute[], segLen: number): MatchResult | null {
+  for (const route of dynamic) {
+    if (route.segments.length !== segLen) continue;
 
-  outer: for (let i = 0; i < segLen; i++) {
-    const isParam = binaryIncludes(paramsIdx, i);
-    if (isParam) continue; // always matches
-
-    if (sharedSegments[i] !== pattern[i]) {
-      return false;
+    let ok = true;
+    for (let i = 0; i < segLen; i++) {
+      const isParam = route.paramIndices.includes(i);
+      if (isParam) continue;
+      if (sharedSegments[i] !== route.segments[i]) {
+        ok = false;
+        break;
+      }
     }
-  }
+    if (!ok) continue;
 
-  return true;
+    const params: Record<string, string> = {};
+    for (let i = 0; i < route.paramIndices.length; i++) {
+      const idx = route.paramIndices[i];
+      params[route.paramNames[i]] = sharedSegments[idx];
+    }
+
+    return { route, params };
+  }
+  return null;
 }
 
-// paramIndices is usually very small, so linear scan is okay.
-// Could be optimized to a Set if needed.
-function binaryIncludes(arr: number[], value: number): boolean {
-  for (let i = 0; i < arr.length; i++) {
-    if (arr[i] === value) return true;
+function matchWildcard(wildcards: CompiledRoute[], segLen: number): MatchResult | null {
+  for (const route of wildcards) {
+    const baseLen = route.segments.length - 1; // last is wildcard
+
+    if (segLen < baseLen) continue;
+
+    // Compare non-wildcard prefix
+    let ok = true;
+    for (let i = 0; i < baseLen; i++) {
+      if (sharedSegments[i] !== route.segments[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+
+    // Wildcard collects remainder:
+    const wildcardStart = baseLen;
+    const collected = sharedSegments.slice(wildcardStart, segLen).join("/");
+
+    const params: Record<string, string> = {
+      [route.wildcardName!]: collected
+    };
+
+    return { route, params };
   }
-  return false;
+
+  return null;
 }
 
-/**
- * Extract params from sharedSegments using the route's paramIndices and names.
- */
-function extractParams(route: CompiledRoute, segLen: number): Record<string, string> {
-  const params: Record<string, string> = {};
-  const indices = route.paramIndices;
-  const names = route.paramNames;
-
-  for (let i = 0; i < indices.length; i++) {
-    const idx = indices[i];
-    if (idx < segLen) {
-      const name = names[i];
-      params[name] = sharedSegments[idx];
-    }
+function normalizePath(path: string): string {
+  if (!path) return "/";
+  if (!path.startsWith("/")) path = "/" + path;
+  if (path.length > 1 && path.endsWith("/")) {
+    path = path.slice(0, -1);
   }
-
-  return params;
+  return path;
 }
